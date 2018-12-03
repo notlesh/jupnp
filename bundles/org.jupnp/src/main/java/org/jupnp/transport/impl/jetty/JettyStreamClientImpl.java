@@ -26,7 +26,7 @@ import org.eclipse.jetty.client.util.BytesContentProvider;
 import org.eclipse.jetty.client.util.StringContentProvider;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpVersion;
-
+import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.jupnp.model.message.StreamRequestMessage;
 import org.jupnp.model.message.StreamResponseMessage;
 import org.jupnp.model.message.UpnpHeaders;
@@ -38,6 +38,7 @@ import org.jupnp.model.message.header.UpnpHeader;
 import org.jupnp.transport.spi.AbstractStreamClient;
 import org.jupnp.transport.spi.InitializationException;
 import org.jupnp.transport.spi.StreamClient;
+import org.jupnp.util.SpecificationViolationReporter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,7 +63,12 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
 
         // These are some safety settings, we should never run into these timeouts as we
         // do our own expiration checking
-        httpClient.setConnectTimeout((getConfiguration().getTimeoutSeconds()+5) * 1000);
+        httpClient.setConnectTimeout((getConfiguration().getTimeoutSeconds() + 5) * 1000);
+        httpClient.setMaxConnectionsPerDestination(2);
+
+        final QueuedThreadPool queuedThreadPool = createThreadPool("jupnp-jetty-client", 5, 5, 60000);
+
+        httpClient.setExecutor(queuedThreadPool);
 
         if (getConfiguration().getSocketBufferSize() != -1) {
             httpClient.setRequestBufferSize(getConfiguration().getSocketBufferSize());
@@ -71,8 +77,7 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
 
         try {
             httpClient.start();
-        }
-        catch (final Exception e){
+        } catch (final Exception e) {
             log.error("Failed to instantiate HTTP client", e);
             throw new InitializationException("Failed to instantiate HTTP client", e);
         }
@@ -95,8 +100,7 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
             case UNSUBSCRIBE:
             case POST:
             case NOTIFY:
-                request = httpClient.newRequest(upnpRequest.getURI())
-                                    .method(upnpRequest.getHttpMethodName());
+                request = httpClient.newRequest(upnpRequest.getURI()).method(upnpRequest.getHttpMethodName());
                 break;
             default:
                 throw new RuntimeException("Unknown HTTP method: " + upnpRequest.getHttpMethodName());
@@ -127,9 +131,8 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
 
         // Add the default user agent if not already set on the message
         if (!requestMessage.getHeaders().containsKey(UpnpHeader.Type.USER_AGENT)) {
-            request.agent(
-                    getConfiguration().getUserAgentValue(requestMessage.getUdaMajorVersion(), requestMessage.getUdaMinorVersion())
-            );
+            request.agent(getConfiguration().getUserAgentValue(requestMessage.getUdaMajorVersion(),
+                    requestMessage.getUdaMinorVersion()));
         }
 
         // Headers
@@ -140,7 +143,7 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
 
     @Override
     protected Callable<StreamResponseMessage> createCallable(final StreamRequestMessage requestMessage,
-                                                             final Request request) {
+            final Request request) {
         return new Callable<StreamResponseMessage>() {
             @Override
             public StreamResponseMessage call() throws Exception {
@@ -151,8 +154,8 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
                     log.trace("Received HTTP response: {}", httpResponse.getReason());
 
                     // Status
-                    final UpnpResponse responseOperation =
-                        new UpnpResponse(httpResponse.getStatus(), httpResponse.getReason());
+                    final UpnpResponse responseOperation = new UpnpResponse(httpResponse.getStatus(),
+                            httpResponse.getReason());
 
                     // Message
                     final StreamResponseMessage responseMessage = new StreamResponseMessage(responseOperation);
@@ -177,8 +180,7 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
                     responseMessage.setBodyCharacters(bytes);
 
                     return responseMessage;
-                }
-                catch (final RuntimeException e) {
+                } catch (final RuntimeException e) {
                     log.error("Request: {} failed", request, e);
                     throw e;
                 }
@@ -198,6 +200,9 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
             // logging rules of the StreamClient#sendRequest() method
             log.trace("Illegal state: {}", t.getMessage());
             return true;
+        } else if (t.getMessage().contains("HTTP protocol violation")) {
+            SpecificationViolationReporter.report(t.getMessage());
+            return true;
         }
         return false;
     }
@@ -207,9 +212,9 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
         log.trace("Shutting down HTTP client connection manager/pool");
         try {
             httpClient.stop();
-       } catch (Exception e) {
-           log.info("Shutting down of HTTP client throwed exception", e);
-       }
+        } catch (Exception e) {
+            log.info("Shutting down of HTTP client throwed exception", e);
+        }
     }
 
     protected <O extends UpnpOperation> ContentProvider.Typed createContentProvider(final UpnpMessage<O> upnpMessage) {
@@ -223,6 +228,14 @@ public class JettyStreamClientImpl extends AbstractStreamClient<StreamClientConf
 
             return new BytesContentProvider(upnpMessage.getBodyBytes());
         }
+    }
+
+    private QueuedThreadPool createThreadPool(String consumerName, int minThreads, int maxThreads,
+            int keepAliveTimeout) {
+        QueuedThreadPool queuedThreadPool = new QueuedThreadPool(maxThreads, minThreads, keepAliveTimeout);
+        queuedThreadPool.setName(consumerName);
+        queuedThreadPool.setDaemon(true);
+        return queuedThreadPool;
     }
 
 }
